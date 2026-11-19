@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+results_v*/
+*.log
+traces/
+*.qcow2
+lzruns/
+data/
+paper/
+results*/

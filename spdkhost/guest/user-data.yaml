@@ -1,0 +1,19 @@
+#cloud-config
+hostname: lzdguest
+users:
+  - name: ubuntu
+    plain_text_passwd: lzdpass
+    lock_passwd: false
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - PUBKEY_PLACEHOLDER
+ssh_pwauth: true
+runcmd:
+  - [ sysctl, -w, vm.nr_hugepages=1024 ]
+  - [ sh, -c, 'echo vm.nr_hugepages=1024 >> /etc/sysctl.d/99-lzd.conf' ]
+  - [ sh, -c, 'echo uio_pci_generic >> /etc/modules-load.d/lzd.conf' ]
+  - [ modprobe, uio_pci_generic ]
+  - [ touch, /root/guest-ready ]
+power_state:
+  mode: poweroff

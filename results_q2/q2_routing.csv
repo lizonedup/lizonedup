@@ -1,0 +1,7 @@
+workload,arm,system,writes,oracle_hits,hits,recall,dedup,phys_red,oracle_phys_red,hit_src_sealed,sealed_hit_frac,fn_sealed,fn_active,wa_total,probe_avg,ra_b_per_req,routing_fn,cold_hits
+container,oracle,PageFTLDedup,7689728,6118631,6118631,1.0,4.894,0.7957,0.2043,0,0.0,0,0,0.2043,0.0,0.0,0,0
+container,v9,LiZoneDedup,7689728,6118631,5761846,0.9417,3.989,0.7493,0.2043,2641721,0.4585,0,0,0.2564,1.593,22.75,356785,6919
+container,v9-prefix,LiZoneDedup-r2-prefix,7689728,6118631,5762184,0.9417,3.989,0.7493,0.2043,2641779,0.4585,0,0,0.2563,1.593,34.05,356447,6961
+fsl,oracle,PageFTLDedup,3381378,634014,634014,1.0,1.231,0.1875,0.8125,0,0.0,0,0,0.8125,0.0,0.0,0,0
+fsl,v9,LiZoneDedup,3381378,634014,539221,0.8505,1.19,0.1595,0.8125,362558,0.6724,0,0,0.8532,1.93,13.9,94793,58897
+fsl,v9-prefix,LiZoneDedup-r2-prefix,3381378,634014,538923,0.85,1.19,0.1594,0.8125,362145,0.672,0,0,0.8533,1.93,22.82,95091,58951

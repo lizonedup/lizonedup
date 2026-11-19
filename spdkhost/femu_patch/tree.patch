@@ -1,0 +1,506 @@
+--- a/hw/femu/meson.build	2026-06-09 21:42:36.276625324 +0800
++++ b/hw/femu/meson.build	2026-11-18 09:19:35.714878083 +0800
+@@ -3,7 +3,7 @@
+                              'nvme-admin.c', 'nvme-io.c', 'femu.c',
+                              'nossd/nop.c', 'nand/nand.c',
+                              'timing-model/timing.c', 'ocssd/oc12.c',
+-                             'ocssd/oc20.c', 'zns/zns.c', 'zns/zftl.c',
++                             'ocssd/oc20.c', 'zns/zns.c', 'zns/zftl.c', 'zns/lizone.c',
+                              'bbssd/bb.c', 'bbssd/ftl.c', 'csd/csd.c',
+                              'lib/pqueue.c', 'lib/rte_ring.c',
+                              'backend/dram.c'))
+--- a/hw/femu/nvme.h	2026-06-09 21:42:36.277243005 +0800
++++ b/hw/femu/nvme.h	2026-11-18 09:19:35.715147999 +0800
+@@ -1337,6 +1337,15 @@
+     int             dsm_nr_ranges;
+     uint32_t        dsm_attributes;
+ 
++    /* LiZoneDedup per-request dedup decision (lizone.h) */
++    uint8_t         lz_zone;       /* 1 = dedup decision made            */
++    uint8_t         lz_hit;
++    uint8_t         lz_pad[6];
++    uint64_t        lz_fp;
++    uint64_t        lz_src_lpn;
++    uint64_t        lz_md_lat_ns;
++    float           lz_cr;
++
+     /* FDP (Flexible Data Placement) */
+     uint16_t        fdp_dspec;
+     uint8_t         fdp_dtype;
+@@ -1529,6 +1538,11 @@
+     uint8_t  zns_num_plane;
+     uint8_t  zns_num_blk;
+     int zns_flash_type;
++    uint8_t  lz_mode;         /* LZ_MODE_* (lizone.h)                   */
++    uint8_t  lz_r;            /* candidate set size                     */
++    uint8_t  lz_sha_hw;       /* 1 = hardware SHA engine                */
++    uint8_t  lz_fallback;     /* 1 = dedup on host-routed zone_append   */
++    uint32_t lz_max_open_zones; /* 0 = unlimited AOR limits             */
+ } ZNSCtrlParams;
+ 
+ typedef struct CsdCtrlParams {
+--- a/hw/femu/femu.c	2026-06-09 21:42:36.275845749 +0800
++++ b/hw/femu/femu.c	2026-11-18 09:19:35.715301063 +0800
+@@ -977,6 +977,12 @@
+     DEFINE_PROP_UINT8("zns_num_plane", FemuCtrl, zns_params.zns_num_plane, 2),
+     DEFINE_PROP_UINT8("zns_num_blk", FemuCtrl, zns_params.zns_num_blk, 32),
+     DEFINE_PROP_INT32("zns_flash_type", FemuCtrl, zns_params.zns_flash_type, QLC),
++    DEFINE_PROP_UINT8("lz_mode", FemuCtrl, zns_params.lz_mode, 0),
++    DEFINE_PROP_UINT8("lz_r", FemuCtrl, zns_params.lz_r, 2),
++    DEFINE_PROP_UINT8("lz_sha_hw", FemuCtrl, zns_params.lz_sha_hw, 1),
++    DEFINE_PROP_UINT8("lz_fallback", FemuCtrl, zns_params.lz_fallback, 0),
++    DEFINE_PROP_UINT32("lz_max_open_zones", FemuCtrl,
++                       zns_params.lz_max_open_zones, 0),
+     DEFINE_PROP_INT32("secsz", FemuCtrl, bb_params.secsz, 512),
+     DEFINE_PROP_INT32("secs_per_pg", FemuCtrl, bb_params.secs_per_pg, 8),
+     DEFINE_PROP_INT32("pgs_per_blk", FemuCtrl, bb_params.pgs_per_blk, 256),
+--- a/hw/femu/nvme-io.c	2026-06-09 21:42:36.276764240 +0800
++++ b/hw/femu/nvme-io.c	2026-11-18 12:54:58.434211754 +0800
+@@ -69,6 +69,11 @@
+         req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+         req->cqe.cid = cmd.cid;
+         req->cmd_opcode = cmd.opcode;
++        /* LiZoneDedup: fresh per-request dedup state */
++        req->lz_zone = 0;
++        req->lz_hit = 0;
++        req->lz_md_lat_ns = 0;
++        req->lz_src_lpn = 0;
+         memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
+ 
+         if (n->print_log) {
+@@ -77,6 +82,8 @@
+ 
+         status = nvme_io_cmd(n, &cmd, req);
+         req->status = status;
++        if (cmd.opcode == NVME_CMD_DSM) {
++        }
+ 
+         if (status != NVME_SUCCESS) {
+             /* Clean up DSM ranges on error */
+--- a/hw/femu/zns/zns.h	2026-06-09 21:42:36.278122145 +0800
++++ b/hw/femu/zns/zns.h	2026-11-18 09:31:03.823233501 +0800
+@@ -41,7 +41,7 @@
+ /**
+  * just to emulate very small read/write latency
+  */
+-#define SRAM_WRITE_LATENCY_NS (1000)
++#define SRAM_WRITE_LATENCY_NS (200000)
+ #define SRAM_READ_LATENCY_NS (1000)
+ 
+ enum {
+@@ -92,6 +92,10 @@
+     uint64_t stime;
+ };
+ 
++/* plane-clock advance used by lizone.c metadata I/O (defined in zftl.c) */
++uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,
++                            struct nand_cmd *ncmd);
++
+ 
+ struct zns_blk {
+     int nand_type;
+@@ -381,4 +385,8 @@
+ void zns_ns_shutdown(NvmeNamespace *ns);
+ void zns_ns_cleanup(NvmeNamespace *ns);
+ 
++/* spdkhost: physically complete a deferred (reset-pending) zone reset */
++uint64_t zns_finish_deferred_reset(FemuCtrl *n, uint32_t zone_idx,
++                                   uint64_t stime);
++
+ #endif
+--- a/hw/femu/zns/zns.c	2026-06-09 21:42:36.278122145 +0800
++++ b/hw/femu/zns/zns.c	2026-11-18 12:54:58.387961721 +0800
+@@ -1,4 +1,5 @@
+ #include "./zns.h"
++#include "lizone.h"
+ 
+ #define MIN_DISCARD_GRANULARITY     (4 * KiB)
+ #define NVME_DEFAULT_ZONE_SIZE      (128 * MiB)
+@@ -464,6 +465,9 @@
+         default:
+             assert(false);
+         }
++        if (lz_is_enabled(ns->ctrl)) {
++            lz_on_zone_seal(ns->ctrl, zns_zone_idx(ns, zone->d.zslba));
++        }
+     }
+ }
+ 
+@@ -502,9 +506,9 @@
+     NvmeZone    *zone;
+ };
+ 
+-static uint64_t zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
++static uint64_t zns_do_physical_reset(NvmeNamespace *ns, NvmeZone *zone,
++                                     uint64_t stime)
+ {
+-    NvmeNamespace *ns = req->ns;
+     FemuCtrl *n = ns->ctrl;
+     struct zns_ssd *zns = n->zns;
+     uint32_t zone_idx = zns_zone_idx(ns, zone->d.zslba);
+@@ -528,7 +532,7 @@
+         break;
+     }
+ 
+-    erase_latency = zns_zone_reset(zns, zone_idx, n->zone_size, zns->lbasz, req->stime);
++    erase_latency = zns_zone_reset(zns, zone_idx, n->zone_size, zns->lbasz, stime);
+ 
+     /* Reset write pointer if this was the active zone */
+     if (zns->active_zone == zone_idx) {
+@@ -539,6 +543,22 @@
+     return erase_latency;
+ }
+ 
++static uint64_t zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
++{
++    return zns_do_physical_reset(req->ns, zone, req->stime);
++}
++
++/* spdkhost: complete a deferred reset after its incoming count hit zero */
++uint64_t zns_finish_deferred_reset(FemuCtrl *n, uint32_t zone_idx,
++                                   uint64_t stime)
++{
++    NvmeNamespace *ns = &n->namespaces[0];
++    NvmeZone *zone = &n->zone_array[zone_idx];
++    uint64_t lat = zns_do_physical_reset(ns, zone, stime);
++    lz_on_zone_reset(n, zone_idx);
++    return lat;
++}
++
+ typedef uint16_t (*op_handler_t)(NvmeNamespace *, NvmeZone *, NvmeZoneState,
+                                  NvmeRequest *);
+ 
+@@ -627,6 +647,7 @@
+ static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
+                                NvmeZoneState state, NvmeRequest *req)
+ {
++    FemuCtrl *n = ns->ctrl;
+     uint64_t erase_lat = 0;
+ 
+     switch (state) {
+@@ -641,6 +662,22 @@
+         return NVME_ZONE_INVAL_TRANSITION;
+     }
+ 
++    if (lz_is_enabled(n)) {
++        uint32_t zidx = zns_zone_idx(ns, zone->d.zslba);
++        if (lz_reset_zone_begin(n, zidx)) {
++            /* deferred: descriptors elsewhere still reference this zone.
++             * The command completes immediately; cdw0 carries the
++             * LZ_RESET_DEFERRED marker.  Data stays readable; appends
++             * are rejected until the reset finalizes.                   */
++            ((NvmeZonedResult *)&req->cqe)->slba =
++                cpu_to_le64(LZ_RESET_DEFERRED);
++            req->reqlat = 20000;   /* RESET_INTENT record + UREF scan */
++            req->expire_time += req->reqlat;
++            return NVME_SUCCESS;
++        }
++        lz_on_zone_reset(n, zidx);
++    }
++
+     erase_lat = zns_aio_zone_reset_cb(req, zone);
+ 
+     req->reqlat = erase_lat;
+@@ -861,6 +898,12 @@
+     if(req->is_write)
+     {
+         zone = zns_get_zone_by_slba(ns, slba);
++        if (lz_is_enabled(n) && lz_zone_is_pending(n, zns_zone_idx(ns, zone->d.zslba))) {
++            /* reset-pending zones stop accepting appends (protocol step 2) */
++            lz_note_append_rejected(n);
++            status = NVME_ZONE_READ_ONLY | NVME_DNR;
++            goto err;
++        }
+         status = zns_check_zone_write(n, ns, zone, slba, nlb, append);
+         if (status) {
+             femu_err("Misao check zone write failed with status (%u)\n",status);
+@@ -905,6 +948,13 @@
+     req->status = NVME_SUCCESS;
+     req->nlb = nlb;
+ 
++    /* spdkhost: fallback dedup must read the payload through the qsg
++     * BEFORE backend_rw destroys the sglist                              */
++    if (req->is_write && append && lz_fallback_active(n)) {
++        uint32_t hint = zns_zone_idx(ns, zone->d.zslba);
++        req->lz_md_lat_ns = lz_decide_write_hint(n, req, hint, (int)hint);
++    }
++
+     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+ 
+     if(req->is_write)
+@@ -1167,10 +1217,147 @@
+     }
+ }
+ 
++/*
++ * spdkhost: LZ_CMD_DUP_APPEND (0xB0) -- the native dedup append.
++ * cdw10 = nlb-1 (nlb must be 1: the primitive is page-granular); the
++ * controller hashes the payload, routes it (C1), appends to the chosen
++ * zone, and runs the dedup decision.  cdw0 of the completion carries
++ * the assigned LBA.
++ */
++static uint16_t zns_dup_append(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
++                               NvmeRequest *req)
++{
++    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
++    uint32_t npages = le32_to_cpu(cmd->cdw10) + 1;   /* 4 KiB pages */
++    uint32_t spp = 4096 / n->zns->lbasz;             /* LBAs per page */
++    uint32_t nlb = npages * spp;                     /* in 512 B LBAs */
++    uint64_t data_size = (uint64_t)npages * 4096;
++    uint64_t data_offset;
++    NvmeZone *zone;
++    NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
++    uint32_t lsh, zone_idx;
++    uint16_t status;
++
++    if (!lz_is_enabled(n)) {
++        return NVME_INVALID_OPCODE | NVME_DNR;
++    }
++    if (npages != 1) {
++        return NVME_INVALID_FIELD | NVME_DNR;   /* page-granular primitive */
++    }
++
++    status = nvme_check_mdts(n, data_size);
++    if (status) {
++        return status | NVME_DNR;
++    }
++
++    /* map the payload once; the hash reads it through the qsg */
++    status = zns_map_dptr(n, data_size, req);
++    if (status) {
++        return status | NVME_DNR;
++    }
++
++    lsh = lz_route_digest(n, req);
++    zone_idx = lz_pick_zone(n, lsh);
++    if (zone_idx >= n->num_zones) {
++        return NVME_ZONE_FULL | NVME_DNR;
++    }
++    zone = &n->zone_array[zone_idx];
++
++    /* never route into a reset-pending zone */
++    if (lz_zone_is_pending(n, zone_idx)) {
++        lz_note_append_rejected(n);
++        return NVME_ZONE_READ_ONLY | NVME_DNR;
++    }
++
++    /* zone state + zasl checks, mirroring zns_check_zone_write(append) */
++    status = zns_check_zone_state_for_write(zone);
++    if (status) {
++        return status | NVME_DNR;
++    }
++    if (data_size > ((uint64_t)n->page_size << n->zasl)) {
++        return NVME_INVALID_FIELD | NVME_DNR;
++    }
++    if (zone->w_ptr + nlb > zns_zone_wr_boundary(zone)) {
++        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
++    }
++
++    /* zns_finalize_zoned_write locates the zone via the command's slba
++     * and advances the host-visible WP from its nlb: rewrite both to
++     * the device-picked zone (the host sent neither for a 0xB0).      */
++    rw->slba = zone->d.zslba;
++    rw->nlb = cpu_to_le16(nlb - 1);
++
++    status = zns_auto_open_zone(ns, zone);
++    if (status) {
++        return status | NVME_DNR;
++    }
++
++    req->is_write = 1;
++    req->nlb = nlb;
++    req->slba = zone->w_ptr;                 /* the assigned LBA */
++    res->slba = zns_advance_zone_wp(ns, zone, nlb);
++
++    /* dedup decision FIRST: it reads the payload through the qsg, and
++     * backend_rw destroys the sglist when it copies the data           */
++    req->lz_md_lat_ns = lz_decide_write(n, req, zone_idx);
++
++    /* data lands in the memory backend: reads stay correct even for
++     * descriptor-backed slots; the NAND program is suppressed later in
++     * the FTL thread when req->lz_hit is set.                              */
++    data_offset = zns_l2b(ns, req->slba);
++    backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
++    zns_finalize_zoned_write(ns, req, false);
++    n->zns->active_zone = zone_idx;
++
++    lz_note_dup_append(n);
++    return NVME_SUCCESS;
++}
++
++/* spdkhost: LZ_CMD_STATS (0xB1) -- optional dptr receives the blob */
++static uint16_t zns_stats_cmd(FemuCtrl *n, NvmeRequest *req)
++{
++    NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
++    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
++    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
++    LZStatsBlob blob;
++
++    lz_stats_blob(n, &blob);
++    lz_dump_stats(n);
++    if (prp1) {
++        dma_read_prp(n, (uint8_t *)&blob, sizeof(blob), prp1, prp2);
++    }
++    return NVME_SUCCESS;
++}
++
++/* spdkhost: LZ_CMD_ZONE_QUERY (0xB2) -- cdw10 = zid */
++static uint16_t zns_zone_query_cmd(FemuCtrl *n, NvmeRequest *req)
++{
++    NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
++    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
++    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
++    uint32_t zid = le32_to_cpu(cmd->cdw10);
++    LZZoneInfo info;
++
++    if (!prp1 || zid >= n->num_zones) {
++        return NVME_INVALID_FIELD | NVME_DNR;
++    }
++    if (lz_zone_query(n, zid, &info) != 0) {
++        return NVME_INVALID_FIELD | NVME_DNR;
++    }
++    dma_read_prp(n, (uint8_t *)&info, sizeof(info), prp1, prp2);
++    return NVME_SUCCESS;
++}
++
+ static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+                            NvmeRequest *req)
+ {
+     switch (cmd->opcode) {
++    case LZ_CMD_DUP_APPEND:
++        return zns_dup_append(n, ns, cmd, req);
++    case LZ_CMD_STATS:
++        return zns_stats_cmd(n, req);
++    case LZ_CMD_ZONE_QUERY:
++        return zns_zone_query_cmd(n, req);
+     case NVME_CMD_READ:
+     case NVME_CMD_WRITE:
+         return zns_nvme_rw(n, ns, cmd, req,false);
+@@ -1322,8 +1509,8 @@
+     n->zone_size_bs = zns->num_ch*zns->num_lun*zns->num_plane*zns->num_page*ZNS_PAGE_SIZE;
+     n->zone_cap_bs = 0;
+     n->cross_zone_read = false;
+-    n->max_active_zones = 0;
+-    n->max_open_zones = 0;
++    n->max_active_zones = n->zns_params.lz_max_open_zones;
++    n->max_open_zones = n->zns_params.lz_max_open_zones;
+     n->zd_extension_size = 0;
+ 
+     return 0;
+@@ -1361,6 +1548,12 @@
+     }
+ 
+     zns_init_zone_identify(n, ns, 0);
++
++    /* spdkhost: enable host discards (UREF path) and init LiZoneDedup */
++    if (n->zns_params.lz_mode != 0) {
++        n->oncs |= NVME_ONCS_DSM;
++    }
++    lz_init(n);
+ }
+ 
+ static void zns_exit(FemuCtrl *n)
+--- a/hw/femu/zns/zftl.c	2026-06-09 21:42:36.277994598 +0800
++++ b/hw/femu/zns/zftl.c	2026-11-18 13:09:17.400750923 +0800
+@@ -1,4 +1,5 @@
+ #include "zns.h"
++#include "lizone.h"
+ 
+ //#define FEMU_DEBUG_ZFTL
+ 
+@@ -68,7 +69,7 @@
+     }
+ }
+ 
+-static uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct nand_cmd *ncmd)
++uint64_t zns_advance_status(struct zns_ssd *zns, struct ppa *ppa,struct nand_cmd *ncmd)
+ {
+     int c = ncmd->cmd;
+ 
+@@ -411,6 +412,12 @@
+     }
+ 
+     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
++        if (req->lz_hit) {
++            /* dedup hit: 16-byte DREF commit; no data page program */
++            sublat += SRAM_WRITE_LATENCY_NS;
++            maxlat = (sublat > maxlat) ? sublat : maxlat;
++            continue;
++        }
+         if(zns->cache.write_cache[wcidx].used==zns->cache.write_cache[wcidx].cap)
+         {
+             ftl_debug("[W] flush wc %d (%u/%u)\n",wcidx,(int)zns->cache.write_cache[wcidx].used,(int)zns->cache.write_cache[wcidx].cap);
+@@ -455,19 +462,71 @@
+             }
+ 
+             ftl_assert(req);
++            if (unlikely(req->status != NVME_SUCCESS)) {
++                /* failed request: skip the timing model entirely (the
++                 * error paths leave slba/nlb stale)                    */
++                req->reqlat = 0;
++                rc = femu_ring_enqueue(zns->to_poller[i], (void *)&req, 1);
++                if (rc != 1) {
++                    ftl_err("FTL to_poller enqueue failed\n");
++                }
++                continue;
++            }
+             switch (req->cmd.opcode) {
+                 // Fix bug: zone append not respecting configured delay
+                 case NVME_CMD_ZONE_APPEND:
+                     /* Fall through */
++                case LZ_CMD_DUP_APPEND:
++                    /* Fall through */
+                 case NVME_CMD_WRITE:
+                     lat = zns_write(zns, req);
++                    if (lz_is_enabled(n) && req->lz_zone) {
++                        lat += req->lz_md_lat_ns;      /* controller compute */
++                        lat += lz_write_ftl(zns, req); /* DREF/INS NAND md   */
++                    }
+                     break;
+-                case NVME_CMD_READ:
++                case NVME_CMD_READ: {
+                     lat = zns_read(zns, req);
++                    if (lz_is_enabled(n)) {
++                        /* descriptor-backed slots: DREF fetch + source read */
++                        uint64_t spp = LOGICAL_PAGE_SIZE / zns->lbasz;
++                        uint64_t lpn0 = req->slba / spp;
++                        uint64_t lpn1 = (req->slba + req->nlb - 1) / spp;
++                        uint64_t lpn, rlat;
++                        for (lpn = lpn0; lpn <= lpn1; lpn++) {
++                            if (lz_read_resolve(zns, lpn, &rlat) >= 0) {
++                                lat += rlat;
++                            }
++                        }
++                    }
+                     break;
+-                case NVME_CMD_DSM:
++                }
++                case NVME_CMD_DSM: {
+                     lat = 0;
++                    if (lz_is_enabled(n) && req->dsm_ranges &&
++                        (req->dsm_attributes & 0x4)) { /* NVME_DSMGMT_AD */
++                        int ri;
++                        for (ri = 0; ri < req->dsm_nr_ranges; ri++) {
++                            lz_on_discard(n,
++                                le64_to_cpu(req->dsm_ranges[ri].slba),
++                                le32_to_cpu(req->dsm_ranges[ri].nlb));
++                        }
++                        while (1) {
++                            int pz = lz_pop_finalize_zone(n);
++                            if (pz < 0) {
++                                break;
++                            }
++                            lat += zns_finish_deferred_reset(n, (uint32_t)pz,
++                                                             req->stime);
++                        }
++                    }
++                    if (req->dsm_ranges) {
++                        g_free(req->dsm_ranges);
++                        req->dsm_ranges = NULL;
++                        req->dsm_nr_ranges = 0;
++                    }
+                     break;
++                }
+                 default:
+                     //ftl_err("FTL received unkown request type, ERROR\n");
+                     ;

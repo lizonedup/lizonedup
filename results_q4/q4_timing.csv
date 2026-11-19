@@ -1,0 +1,5 @@
+arm,system,write_mbs,phys_mbs,w_p50,w_p99,hit,ra_b
+lizone,v9,1568.2,488.5,14.7,219.3,0.6885,1.8
+global-flash@40MB,globalindex,1404.3,437.4,11.5,252.2,0.6885,1275.9
+global-flash@4MB,globalindex,801.1,249.5,147.6,372.2,0.6885,1991.1
+nodedup,nodedup,629.9,629.9,201.0,201.0,0.0,0.0
