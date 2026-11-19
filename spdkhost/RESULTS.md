@@ -135,6 +135,31 @@ append now fails fast with ENOSPC once no zone is appendable after a
 refresh (previously each write past logical capacity burned the full
 64-retry budget).
 
+## Checkpoint & recovery costs (t10, Reviewer E3)
+
+Vendor command 0xB3 (`lzd_checkpoint`): op 0 serializes the checkpoint
+(route table: 32 groups x primary + lineage; per-zone reference-plane
+aggregates: state + incoming), op 1 restores it and reports the
+metadata-log delta since the last save (the crash-recovery replay
+length).  Timing-model costs use the prototype calibration (200 us page
+program / 40 us read); wall-clock is the emulator's serialize/copy time.
+Fresh device, native mode, three log lengths (`lzdtest -t t10`):
+
+| point | ckpt size | ckpt write | replay delta | replay reads | recovery model |
+|---|---|---|---|---|---|
+| after 100 k writes | 1,416 B = **1 page** | 200 us (model); 1-3 us serialize | 3.06 MB | 746 pg | **29.8 ms** |
+| after 400 k cumulative | 1,416 B = 1 page | 200 us | 10.11 MB | 2,467 pg | **98.7 ms** |
+| after 1,000 k cumulative | 1,416 B = 1 page | 200 us | 21.21 MB | 5,177 pg | **207.1 ms** |
+
+Answer to "how often / what does it cost": the checkpoint itself is a
+single NAND page (sub-millisecond) — at any reasonable interval it is
+free; recovery cost is linear in the log length since the last
+checkpoint (746 -> 5,177 pages over 100k -> 1M writes ≈ 35 B of metadata
+log per write), so a 100 k-write checkpoint interval bounds worst-case
+recovery at ~30 ms while amortizing the checkpoint to 2 ns per write.
+Post-restore correctness is verified (duplicate write + byte-exact
+read-back at every phase; T10 13/13).
+
 ## Reproduce
 
 On a Linux host with KVM (see `run/` scripts; they assume `~/lzd` layout):

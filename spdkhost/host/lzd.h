@@ -30,6 +30,7 @@
 #define LZD_CMD_DUP_APPEND   0xB0
 #define LZD_CMD_STATS        0xB1
 #define LZD_CMD_ZONE_QUERY   0xB2
+#define LZD_CMD_CHECKPOINT   0xB3
 #define LZD_RESET_DEFERRED   0x5AD5D5D5u   /* cdw0 marker */
 
 /* write path selector */
@@ -128,6 +129,23 @@ int lzd_zone_close(struct lzd_ctx *c, uint64_t zslba);
 int lzd_zone_report(struct lzd_ctx *c, lzd_zone_desc *zones, uint32_t *nr);
 int lzd_get_stats(struct lzd_ctx *c, lzd_stats *st);
 int lzd_zone_query(struct lzd_ctx *c, uint32_t zid, lzd_zinfo *info);
+
+/* checkpoint blob (must match lizone.h LZCkptInfo byte-for-byte) */
+typedef struct lzd_ckptinfo {
+    uint32_t magic;
+    uint32_t op;
+    uint32_t ok;
+    uint32_t ckpt_bytes;
+    uint32_t ckpt_pages;
+    uint64_t wall_ns;
+    uint64_t model_ns;
+    uint64_t n_writes;
+    uint64_t md_delta_bytes;
+    uint64_t replay_pages;
+} lzd_ckptinfo;
+
+/* op 0 = save checkpoint, 1 = restore from the last checkpoint */
+int lzd_checkpoint(struct lzd_ctx *c, int op, lzd_ckptinfo *out);
 
 /* ---- content hashing (bit-exact mirrors of the device) ---- */
 uint64_t lzd_fingerprint(const void *page);

@@ -43,6 +43,7 @@ enum {
 #define LZ_CMD_DUP_APPEND   0xB0    /* cdw10 = nlb-1, result = assigned LBA */
 #define LZ_CMD_STATS        0xB1    /* optional dptr: stats blob DMA'd back  */
 #define LZ_CMD_ZONE_QUERY   0xB2    /* cdw10 = zid, dptr: LZZoneInfo         */
+#define LZ_CMD_CHECKPOINT   0xB3    /* cdw10: 0=save 1=restore; dptr: blob    */
 
 /* zone-reset result marker returned in cdw0 (NvmeZonedResult.slba):
  * low 32 bits (0x5AD5D5D5) are what the host reads from cdw0 */
@@ -97,6 +98,23 @@ typedef struct LZStatsBlob {
     uint64_t n_seals;
     uint64_t incoming_peak;
 } LZStatsBlob;
+
+/* checkpoint result blob (LZ_CMD_CHECKPOINT) */
+#define LZ_CKPT_MAGIC       0x4C5A434Bu  /* "LZCK" */
+typedef struct LZCkptInfo {
+    uint32_t magic;
+    uint32_t op;             /* 0 saved, 1 restored */
+    uint32_t ok;
+    uint32_t ckpt_bytes;     /* serialized checkpoint size            */
+    uint32_t ckpt_pages;     /* ceil(bytes/4096) NAND pages           */
+    uint64_t wall_ns;        /* measured serialize/restore wall time  */
+    uint64_t model_ns;       /* timing-model cost (pages x NAND lat)  */
+    uint64_t n_writes;       /* device writes covered by the ckpt     */
+    uint64_t md_delta_bytes; /* metadata log bytes since last ckpt    */
+    uint64_t replay_pages;   /* md_delta_bytes / 4096 (recovery scan) */
+} LZCkptInfo;
+
+int lz_checkpoint(FemuCtrl *n, int op, LZCkptInfo *info);
 
 /* per-zone info returned by LZ_CMD_ZONE_QUERY */
 #define LZ_ZINFO_MAGIC     0x4C5A5A49u  /* "LZZI" */

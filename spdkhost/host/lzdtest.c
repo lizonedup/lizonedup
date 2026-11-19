@@ -805,6 +805,73 @@ static int do_t9(void)
     return 0;
 }
 
+
+/* ---------------- t10: checkpoint & recovery costs (E3) ---------------- */
+static void ckpt_report(const char *phase, const char *kind,
+                        lzd_ckptinfo *ck)
+{
+    /* timing-model costs use the paper's prototype calibration
+     * (200 us page program / 40 us page read, spdkhost README); the
+     * emulator wall-clock is reported alongside for completeness     */
+    uint64_t lat = (ck->op == 0) ? 200000u : 40000u;
+    printf("CKPT %s %s op=%u ok=%u bytes=%u pages=%u wall=%" PRIu64 "ns "
+           "model=%" PRIu64 "ns md_delta=%" PRIu64 "B replay=%" PRIu64 "pg "
+           "replay_model=%" PRIu64 "ns\n",
+           phase, kind, ck->op, ck->ok, ck->ckpt_bytes, ck->ckpt_pages,
+           ck->wall_ns, (uint64_t)ck->ckpt_pages * lat,
+           ck->md_delta_bytes, ck->replay_pages,
+           ck->replay_pages * 40000u);
+    fflush(stdout);
+}
+
+static int do_t10(void)
+{
+    /* recovery-vs-log-length: save a baseline checkpoint, then per burst
+     * [write N pages] -> RESTORE (reports the metadata-log delta since
+     * the previous save, i.e., the crash-recovery replay length) ->
+     * SAVE (fresh checkpoint).  Three log lengths, one device run.     */
+    static const uint32_t bursts[] = { 100000, 300000, 600000 };
+    lzd_ckptinfo ck;
+    uint8_t *pg = spdk_dma_zmalloc(LZD_PAGE, 4096, NULL);
+    uint64_t base = 0x7100000;
+    uint32_t b, i;
+    int phase = 0;
+
+    if (!pg) {
+        check(0, "t10 alloc");
+        return 1;
+    }
+    check(lzd_checkpoint(g_ctx, 0, &ck) == 0 && ck.ok == 1, "ckpt baseline");
+    ckpt_report("p0-baseline", "save", &ck);
+    for (b = 0; b < 3; b++) {
+        uint32_t n = bursts[b];
+        for (i = 0; i < n; i++) {
+            uint64_t l;
+            fill_page(i & 1 ? base + (i % 4096) : base + 0x1000000 + i, pg);
+            if (wr(g_ctx, pg, &l) != 0) {
+                break;
+            }
+        }
+        phase++;
+        char tag[32];
+        snprintf(tag, sizeof(tag), "p%d-after%uk", phase, n / 1000);
+        check(lzd_checkpoint(g_ctx, 1, &ck) == 0 && ck.ok == 1,
+              "ckpt restore p%d", phase);
+        ckpt_report(tag, "restore", &ck);
+        check(lzd_checkpoint(g_ctx, 0, &ck) == 0 && ck.ok == 1,
+              "ckpt save p%d", phase);
+        ckpt_report(tag, "save", &ck);
+        /* correctness after restore: one dup + read-back */
+        uint64_t lba;
+        fill_page(base + 1, pg);
+        check(wr(g_ctx, pg, &lba) == 0, "post-restore write");
+        check(verify_read(g_ctx, lba, base + 1) == 0,
+              "post-restore read-back");
+    }
+    spdk_dma_free(pg);
+    return 0;
+}
+
 /* ---------------- bench: async QD-N throughput ---------------- */
 static int g_bench_slot_free[64];
 static uint64_t g_bench_done, g_bench_err;
@@ -963,6 +1030,7 @@ int main(int argc, char **argv)
         else if (!strcmp(tok, "t6p2")) do_t6p2();
         else if (!strcmp(tok, "t8")) do_t8();
         else if (!strcmp(tok, "t9")) do_t9();
+        else if (!strcmp(tok, "t10")) do_t10();
         else if (!strcmp(tok, "bench")) do_bench(qd, npages);
         else { fprintf(stderr, "unknown test %s\n", tok); usage(); return 1; }
     }

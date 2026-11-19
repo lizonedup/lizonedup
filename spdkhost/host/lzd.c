@@ -739,3 +739,26 @@ int lzd_zone_query(struct lzd_ctx *c, uint32_t zid, lzd_zinfo *info)
     spdk_dma_free(buf);
     return rc < 0 ? rc : 0;
 }
+
+int lzd_checkpoint(struct lzd_ctx *c, int op, lzd_ckptinfo *out)
+{
+    struct spdk_nvme_cmd cmd;
+    uint8_t *buf = spdk_dma_zmalloc(sizeof(lzd_ckptinfo), 4096, NULL);
+    int rc;
+
+    if (!buf) {
+        return -ENOMEM;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opc = LZD_CMD_CHECKPOINT;
+    cmd.nsid = 1;
+    cmd.cdw10 = (uint32_t)op;
+    rc = lzd_io_raw(c, &cmd, buf, sizeof(lzd_ckptinfo));
+    if (rc == 0) {
+        memcpy(out, buf, sizeof(*out));
+    } else {
+        memset(out, 0, sizeof(*out));
+    }
+    spdk_dma_free(buf);
+    return rc < 0 ? rc : 0;
+}

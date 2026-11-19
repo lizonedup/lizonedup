@@ -373,6 +373,20 @@
 +        return zns_stats_cmd(n, req);
 +    case LZ_CMD_ZONE_QUERY:
 +        return zns_zone_query_cmd(n, req);
++    case LZ_CMD_CHECKPOINT: {
++        /* E3: route-table checkpoint save/restore; cdw10 = 0 save / 1
++         * restore; optional dptr receives the LZCkptInfo blob          */
++        NvmeCmd *c = (NvmeCmd *)&req->cmd;
++        uint64_t prp1 = le64_to_cpu(c->dptr.prp1);
++        uint64_t prp2 = le64_to_cpu(c->dptr.prp2);
++        LZCkptInfo ck;
++        lz_checkpoint(n, le32_to_cpu(c->cdw10) & 1, &ck);
++        lz_dump_stats(n);
++        if (prp1) {
++            dma_read_prp(n, (uint8_t *)&ck, sizeof(ck), prp1, prp2);
++        }
++        return NVME_SUCCESS;
++    }
      case NVME_CMD_READ:
      case NVME_CMD_WRITE:
          return zns_nvme_rw(n, ns, cmd, req,false);

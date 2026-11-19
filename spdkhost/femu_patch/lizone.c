@@ -1121,6 +1121,105 @@ int lz_zone_query(FemuCtrl *n, uint32_t zid, LZZoneInfo *info)
     return 0;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* spdkhost/E3: route-table checkpoint save/restore (LZ_CMD_CHECKPOINT).
+ * The checkpoint covers the C1 route table (32 groups x primary +
+ * lineage) and the per-zone reference-plane aggregates (state,
+ * incoming) -- everything the paper's recovery path loads before
+ * replaying the metadata delta log.  The snapshot lives in controller
+ * memory (survives guest-process crashes, i.e., the T6 regime); the
+ * timing-model cost of the NAND write/read is reported separately in
+ * model_ns so emulator wall-clock distortion does not pollute it.     */
+
+typedef struct LZCkpt {
+    uint32_t magic;              /* LZ_CKPT_MAGIC                        */
+    uint32_t version;
+    uint64_t n_writes;
+    uint64_t md_write_bytes_at_save;
+    uint64_t md_read_pages_at_save;
+    int32_t  primary[LZ_MAX_GROUPS];
+    int32_t  lineage[LZ_MAX_GROUPS][LZ_LINEAGE_DEPTH];
+    int32_t  nlin[LZ_MAX_GROUPS];
+    uint32_t n_zones;
+    /* n_zones x {zid, state, incoming_refs} follow */
+} LZCkpt;
+
+static uint8_t *lz_ckpt_buf;
+static size_t   lz_ckpt_len;
+
+int lz_checkpoint(FemuCtrl *n, int op, LZCkptInfo *info)
+{
+    memset(info, 0, sizeof(*info));
+    info->magic = LZ_CKPT_MAGIC;
+    info->op = (uint32_t)op;
+    if (!lz_inited || !LZ.enabled) {
+        return -1;
+    }
+    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (op == 0) {
+        qemu_mutex_lock(&lz_lock);
+        size_t len = sizeof(LZCkpt) + (size_t)LZ.n_zones * 12;
+        lz_ckpt_buf = g_realloc(lz_ckpt_buf, len);
+        LZCkpt *ck = (LZCkpt *)lz_ckpt_buf;
+        memset(ck, 0, sizeof(*ck));
+        ck->magic = LZ_CKPT_MAGIC;
+        ck->version = 1;
+        ck->n_writes = LZ.n_writes;
+        ck->md_write_bytes_at_save = LZ.md_write_bytes;
+        ck->md_read_pages_at_save = LZ.md_read_pages;
+        memcpy(ck->primary, LZ.primary, sizeof(ck->primary));
+        memcpy(ck->lineage, LZ.lineage, sizeof(ck->lineage));
+        memcpy(ck->nlin, LZ.nlin, sizeof(ck->nlin));
+        ck->n_zones = (uint32_t)LZ.n_zones;
+        uint8_t *tail = lz_ckpt_buf + sizeof(LZCkpt);
+        int i;
+        for (i = 0; i < LZ.n_zones; i++) {
+            uint32_t ent[3] = { (uint32_t)LZ.zones[i].zid,
+                                (uint32_t)LZ.zones[i].state,
+                                LZ.zones[i].incoming_refs };
+            memcpy(tail + (size_t)i * 12, ent, 12);
+        }
+        qemu_mutex_unlock(&lz_lock);
+        lz_ckpt_len = len;
+        info->ckpt_bytes = (uint32_t)len;
+    } else {
+        if (!lz_ckpt_buf || lz_ckpt_len < sizeof(LZCkpt)) {
+            return -1;
+        }
+        LZCkpt *ck = (LZCkpt *)lz_ckpt_buf;
+        if (ck->magic != LZ_CKPT_MAGIC) {
+            return -1;
+        }
+        qemu_mutex_lock(&lz_lock);
+        memcpy(LZ.primary, ck->primary, sizeof(LZ.primary));
+        memcpy(LZ.lineage, ck->lineage, sizeof(LZ.lineage));
+        memcpy(LZ.nlin, ck->nlin, sizeof(LZ.nlin));
+        uint8_t *tail = lz_ckpt_buf + sizeof(LZCkpt);
+        uint32_t i;
+        for (i = 0; i < ck->n_zones && (int)i < LZ.n_zones; i++) {
+            uint32_t ent[3];
+            memcpy(ent, tail + (size_t)i * 12, 12);
+            if ((int)ent[0] < LZ.n_zones) {
+                LZ.zones[ent[0]].incoming_refs = ent[2];
+            }
+        }
+        qemu_mutex_unlock(&lz_lock);
+        info->ckpt_bytes = (uint32_t)lz_ckpt_len;
+        info->n_writes = ck->n_writes;
+        info->md_delta_bytes = LZ.md_write_bytes - ck->md_write_bytes_at_save;
+    }
+    int64_t t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    info->wall_ns = (uint64_t)(t1 - t0);
+    info->ckpt_pages = (info->ckpt_bytes + 4095) / 4096;
+    uint64_t lat = (op == 0) ? n->zns->timing.pg_wr_lat[n->zns->flash_type]
+                             : n->zns->timing.pg_rd_lat[n->zns->flash_type];
+    info->model_ns = (uint64_t)info->ckpt_pages * lat;
+    info->replay_pages = info->md_delta_bytes / 4096;
+    info->ok = 1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* stats                                                               */
 
